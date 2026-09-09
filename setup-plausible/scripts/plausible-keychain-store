@@ -1,0 +1,27 @@
+#!/usr/bin/expect -f
+
+# Store a secret read from stdin without putting it in argv or command output.
+log_user 0
+if {$argc != 2} {
+  exit 64
+}
+
+set service [lindex $argv 0]
+set account [lindex $argv 1]
+set secret [string trimright [read stdin] "\r\n"]
+
+spawn -noecho /usr/bin/security add-generic-password -U -a $account -s $service -w
+set timeout 15
+expect {
+  -re {(?i)password.*:} {
+    send -- "$secret\r"
+    exp_continue
+  }
+  timeout {
+    exit 124
+  }
+  eof {
+    catch wait result
+    exit [lindex $result 3]
+  }
+}

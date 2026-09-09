@@ -1,0 +1,4 @@
+interface:
+  display_name: "Set Up Plausible"
+  short_description: "Install, diagnose, and report Plausible"
+  default_prompt: "Use $setup-plausible to install or diagnose Plausible, manage goals, and report or compare analytics for this site."

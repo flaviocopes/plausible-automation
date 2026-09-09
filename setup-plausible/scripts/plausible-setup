@@ -1,0 +1,1337 @@
+#!/usr/bin/env python3
+"""Install, configure, and query a self-hosted Plausible CE instance."""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import csv
+from datetime import date, timedelta
+import difflib
+import html
+from html.parser import HTMLParser
+import http.cookiejar
+import io
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+
+VERSION = "1.0.0"
+PLAUSIBLE_URL_ENV = "PLAUSIBLE_URL"
+CONFIG_PATH_ENV = "PLAUSIBLE_SETUP_CONFIG"
+DEFAULT_TIMEZONE = "UTC"
+DEFAULT_METRICS = ["visitors", "visits", "pageviews", "bounce_rate", "visit_duration"]
+BREAKDOWN_DIMENSIONS = {
+    "browser": "visit:browser",
+    "browser-version": "visit:browser_version",
+    "campaign": "visit:utm_campaign",
+    "channel": "visit:channel",
+    "city": "visit:city_name",
+    "city-id": "visit:city",
+    "country": "visit:country_name",
+    "country-code": "visit:country",
+    "device": "visit:device",
+    "entry-page": "visit:entry_page",
+    "entry-hostname": "visit:entry_page_hostname",
+    "exit-page": "visit:exit_page",
+    "exit-hostname": "visit:exit_page_hostname",
+    "goal": "event:goal",
+    "hostname": "event:hostname",
+    "medium": "visit:utm_medium",
+    "os": "visit:os",
+    "os-version": "visit:os_version",
+    "page": "event:page",
+    "referrer": "visit:referrer",
+    "region": "visit:region_name",
+    "region-code": "visit:region",
+    "source": "visit:source",
+    "utm-content": "visit:utm_content",
+    "utm-source": "visit:utm_source",
+    "utm-term": "visit:utm_term",
+}
+
+
+class SetupError(RuntimeError):
+    pass
+
+
+class MissingKeychainItem(SetupError):
+    pass
+
+
+def config_path() -> Path:
+    override = os.environ.get(CONFIG_PATH_ENV)
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".config/plausible-setup/config.json"
+
+
+def load_configured_url() -> str | None:
+    path = config_path()
+    if not path.exists():
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SetupError(f"Could not read Plausible configuration at {path}.") from exc
+    if not isinstance(value, dict) or not isinstance(value.get("plausible_url"), str):
+        raise SetupError(f"Plausible configuration at {path} is invalid.")
+    return value["plausible_url"]
+
+
+def save_configured_url(value: str) -> Path:
+    path = config_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"plausible_url": normalize_base_url(value)}, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        path.chmod(0o600)
+    except OSError as exc:
+        raise SetupError(f"Could not write Plausible configuration at {path}.") from exc
+    return path
+
+
+def configured_base_url(cli_value: str | None) -> str:
+    value = cli_value or os.environ.get(PLAUSIBLE_URL_ENV) or load_configured_url()
+    if not value:
+        raise SetupError(
+            "Plausible is not configured. Run `plausible-setup configure "
+            "--plausible-url https://plausible.example.com`."
+        )
+    return normalize_base_url(value)
+
+
+class FormParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.forms: list[dict[str, object]] = []
+        self._form: dict[str, object] | None = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        values = dict(attrs)
+        if tag == "form":
+            self._form = {
+                "action": values.get("action") or "",
+                "method": (values.get("method") or "get").lower(),
+                "inputs": {},
+            }
+            self.forms.append(self._form)
+        elif tag == "input" and self._form is not None and values.get("name"):
+            inputs = self._form["inputs"]
+            assert isinstance(inputs, dict)
+            inputs[str(values["name"])] = values.get("value") or ""
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "form":
+            self._form = None
+
+
+def parse_forms(body: str) -> list[dict[str, object]]:
+    parser = FormParser()
+    parser.feed(body)
+    return parser.forms
+
+
+def select_form(body: str, action_prefix: str) -> dict[str, object]:
+    for form in parse_forms(body):
+        action = str(form["action"])
+        if action == action_prefix or action.startswith(action_prefix + "?"):
+            return form
+    raise SetupError(f"Could not find the expected {action_prefix} dashboard form.")
+
+
+def run_security(args: list[str]) -> str:
+    try:
+        result = subprocess.run(
+            ["security", *args],
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except FileNotFoundError as exc:
+        raise SetupError("macOS Keychain command `security` is unavailable.") from exc
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or "").strip()
+        if "could not be found" in detail or "specified item could not be found" in detail:
+            raise MissingKeychainItem("The required Plausible Keychain item is missing.") from exc
+        raise SetupError("Could not access the Plausible Keychain item.") from exc
+    return result.stdout.strip() if result.stdout else ""
+
+
+def keychain_account(service: str) -> str:
+    metadata = run_security(["find-generic-password", "-s", service])
+    account_match = re.search(r'"acct"<blob>="([^"]+)"', metadata)
+    if not account_match:
+        raise SetupError("The Plausible Keychain item has no account value.")
+    return account_match.group(1)
+
+
+def keychain_secret(service: str) -> str:
+    secret = run_security(["find-generic-password", "-s", service, "-w"])
+    if not secret:
+        raise SetupError("The Plausible Keychain item is empty.")
+    return secret
+
+
+def prompt_store_secret(service: str, account: str, label: str) -> None:
+    if not sys.stdin.isatty():
+        raise SetupError(f"Run this command in an interactive terminal to store the {label}.")
+    print(f"Paste the {label} at the secure Keychain prompt.")
+    try:
+        subprocess.run(
+            [
+                "security",
+                "add-generic-password",
+                "-U",
+                "-a",
+                account,
+                "-s",
+                service,
+                "-w",
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError) as exc:
+        raise SetupError(f"Could not save the {label} in macOS Keychain.") from exc
+
+
+def store_generated_secret(service: str, account: str, secret: str) -> None:
+    """Store a generated secret through stdin, keeping it out of argv and logs."""
+    helper_candidates = [
+        Path(__file__).resolve().with_name("plausible-keychain-store"),
+        Path.home() / ".codex/skills/setup-plausible/scripts/plausible-keychain-store",
+    ]
+    helper = next((candidate for candidate in helper_candidates if candidate.is_file()), None)
+    if helper is None:
+        raise SetupError("The Plausible Keychain storage helper is missing.")
+    try:
+        subprocess.run(
+            [str(helper), service, account],
+            input=secret + "\n",
+            text=True,
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise SetupError("Could not store the generated API key in macOS Keychain.") from exc
+
+
+def save_login_credentials(service: str, email: str | None) -> None:
+    if not sys.stdin.isatty():
+        raise SetupError("Run `plausible-setup credentials` in an interactive terminal.")
+    account = (email or input("Plausible email: ")).strip()
+    if not account or "@" not in account:
+        raise SetupError("A valid Plausible login email is required.")
+    prompt_store_secret(service, account, "Plausible password")
+    print(f"Saved Plausible credentials in Keychain service {service}.")
+
+
+def load_login_credentials(service: str) -> tuple[str, str]:
+    return keychain_account(service), keychain_secret(service)
+
+
+def normalize_base_url(value: str) -> str:
+    parsed = urllib.parse.urlparse(value)
+    if parsed.scheme != "https" or not parsed.hostname:
+        raise SetupError("The Plausible URL must be an HTTPS origin.")
+    return f"https://{parsed.netloc}"
+
+
+def request_url(
+    url: str,
+    *,
+    method: str = "GET",
+    form: dict[str, str] | None = None,
+    json_body: object | None = None,
+    headers: dict[str, str] | None = None,
+    opener: urllib.request.OpenerDirector | None = None,
+) -> tuple[str, int, bytes]:
+    data: bytes | None = None
+    request_headers = dict(headers or {})
+    if form is not None:
+        data = urllib.parse.urlencode(form).encode("utf-8")
+        request_headers["Content-Type"] = "application/x-www-form-urlencoded"
+    elif json_body is not None:
+        data = json.dumps(json_body).encode("utf-8")
+        request_headers["Content-Type"] = "application/json"
+    request_headers.setdefault("Accept", "application/json, text/html;q=0.9")
+    request_headers.setdefault("User-Agent", f"plausible-setup/{VERSION}")
+    request = urllib.request.Request(url, data=data, method=method, headers=request_headers)
+    client = opener or urllib.request.build_opener()
+    try:
+        with client.open(request, timeout=30) as response:
+            return response.geturl(), response.status, response.read()
+    except urllib.error.HTTPError as exc:
+        body = exc.read()
+        detail = ""
+        try:
+            parsed = json.loads(body.decode("utf-8"))
+            detail = parsed.get("detail") or parsed.get("error") or ""
+        except (UnicodeDecodeError, json.JSONDecodeError, AttributeError):
+            pass
+        suffix = f": {detail}" if detail else ""
+        raise SetupError(f"Plausible returned HTTP {exc.code}{suffix}") from exc
+    except urllib.error.URLError as exc:
+        host = urllib.parse.urlparse(url).netloc
+        raise SetupError(f"Could not connect to {host}.") from exc
+
+
+class PlausibleSession:
+    def __init__(self, base_url: str) -> None:
+        self.base_url = base_url.rstrip("/")
+        jar = http.cookiejar.CookieJar()
+        self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+
+    def request(self, path: str, fields: dict[str, str] | None = None) -> tuple[str, str]:
+        url = urllib.parse.urljoin(self.base_url + "/", path.lstrip("/"))
+        final_url, _, body = request_url(url, method="POST" if fields is not None else "GET", form=fields, opener=self.opener)
+        return final_url, body.decode("utf-8", errors="replace")
+
+    def login(self, email: str, password: str) -> None:
+        _, body = self.request("/login")
+        form = select_form(body, "/login")
+        inputs = dict(form["inputs"])
+        inputs.update({"email": email, "password": password, "return_to": "/sites"})
+        final_url, response = self.request(str(form["action"]), inputs)
+        parsed_path = urllib.parse.urlparse(final_url).path
+        if "2fa" in parsed_path or "two-factor" in response.lower():
+            raise SetupError("This Plausible account requires two-factor authentication, which the CLI does not bypass.")
+        if parsed_path == "/login" or "invalid email or password" in response.lower():
+            raise SetupError("Plausible login failed; update the Keychain credentials and try again.")
+        if parsed_path not in {"/", "/sites"} and not parsed_path.startswith("/sites"):
+            raise SetupError("Plausible login ended at an unexpected dashboard page.")
+
+    def site_exists(self, domain: str) -> bool:
+        final_url, body = self.request("/sites")
+        if urllib.parse.urlparse(final_url).path == "/login":
+            raise SetupError("The Plausible session expired while checking sites.")
+        visible = html.unescape(re.sub(r"<[^>]+>", " ", body))
+        return re.search(rf"(?<![A-Za-z0-9.-]){re.escape(domain)}(?![A-Za-z0-9.-])", visible) is not None
+
+    def ensure_site(self, domain: str, timezone: str) -> str:
+        if self.site_exists(domain):
+            return "already exists"
+        _, body = self.request("/sites/new")
+        form = select_form(body, "/sites")
+        inputs = dict(form["inputs"])
+        inputs.update({"site[domain]": domain, "site[timezone]": timezone})
+        final_url, response = self.request(str(form["action"]), inputs)
+        final_path = urllib.parse.unquote(urllib.parse.urlparse(final_url).path)
+        if final_path.startswith(f"/{domain}/installation"):
+            return "created"
+        if self.site_exists(domain):
+            return "already exists"
+        errors = " ".join(re.findall(r"<p[^>]*>(.*?)</p>", response, flags=re.DOTALL))
+        clean_errors = html.unescape(re.sub(r"<[^>]+>", " ", errors))
+        clean_errors = re.sub(r"\s+", " ", clean_errors).strip()
+        suffix = f" Dashboard response: {clean_errors[:240]}" if clean_errors else ""
+        raise SetupError("Plausible did not create the site." + suffix)
+
+    def create_stats_key(self, name: str) -> str:
+        _, body = self.request("/settings/api-keys/new")
+        form = select_form(body, "/settings/api-keys")
+        inputs = dict(form["inputs"])
+        generated_key = str(inputs.get("api_key[key]") or "")
+        if not generated_key:
+            raise SetupError("Plausible did not provide a generated Stats API key.")
+        inputs.update(
+            {
+                "api_key[name]": name,
+                "api_key[type]": "stats_api",
+                "api_key[key]": generated_key,
+            }
+        )
+        final_url, response = self.request(str(form["action"]), inputs)
+        final_path = urllib.parse.urlparse(final_url).path
+        if final_path != "/settings/api-keys" or "API key created successfully" not in response:
+            raise SetupError("Plausible did not confirm Stats API key creation.")
+        return generated_key
+
+
+def infer_domain(root: Path) -> str:
+    for config_name in ("astro.config.mjs", "astro.config.js", "astro.config.ts"):
+        config = root / config_name
+        if config.exists():
+            match = re.search(
+                r"\bsite\s*:\s*['\"]https?://([^/'\"]+)",
+                config.read_text(encoding="utf-8"),
+            )
+            if match:
+                return match.group(1).removeprefix("www.")
+    package_file = root / "package.json"
+    if package_file.exists():
+        try:
+            homepage = json.loads(package_file.read_text(encoding="utf-8")).get("homepage")
+            if homepage:
+                hostname = urllib.parse.urlparse(homepage).hostname
+                if hostname:
+                    return hostname.removeprefix("www.")
+        except (json.JSONDecodeError, OSError):
+            pass
+    if "." in root.name and " " not in root.name:
+        return root.name.removeprefix("www.")
+    raise SetupError("Could not infer the public domain; pass --domain.")
+
+
+def infer_timezone() -> str:
+    if os.environ.get("TZ"):
+        return os.environ["TZ"]
+    for path in (Path("/etc/localtime"), Path("/var/db/timezone/localtime")):
+        try:
+            resolved = str(path.resolve())
+            marker = "/zoneinfo/"
+            if marker in resolved:
+                return resolved.split(marker, 1)[1]
+        except OSError:
+            pass
+    return DEFAULT_TIMEZONE
+
+
+def validate_domain(domain: str) -> str:
+    value = domain.strip().lower().removeprefix("https://").removeprefix("http://")
+    value = value.rstrip("/").removeprefix("www.")
+    if "/" in value or not re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?", value):
+        raise SetupError("Domain must be a naked hostname such as example.com.")
+    return value
+
+
+def project_root(value: str) -> Path:
+    root = Path(value).expanduser().resolve()
+    if not root.is_dir():
+        raise SetupError(f"Project root does not exist: {root}")
+    return root
+
+
+def resolve_domain(root_value: str, domain: str | None) -> tuple[Path, str]:
+    root = project_root(root_value)
+    return root, validate_domain(domain or infer_domain(root))
+
+
+def resolve_target(root: Path, explicit: str | None) -> Path:
+    if explicit:
+        target = (root / explicit).resolve() if not Path(explicit).is_absolute() else Path(explicit).resolve()
+        try:
+            target.relative_to(root.resolve())
+        except ValueError as exc:
+            raise SetupError("The target file must be inside the project root.") from exc
+        if not target.is_file():
+            raise SetupError(f"Target file does not exist: {target}")
+        return target
+
+    preferred = [
+        root / "src/layouts/Base.astro",
+        root / "src/layouts/Layout.astro",
+        root / "src/app.html",
+        root / "index.html",
+        root / "public/index.html",
+    ]
+    for candidate in preferred:
+        if candidate.is_file() and "</head>" in candidate.read_text(encoding="utf-8"):
+            return candidate
+
+    layouts = []
+    layout_root = root / "src/layouts"
+    if layout_root.is_dir():
+        for candidate in sorted(layout_root.rglob("*")):
+            if candidate.suffix in {".astro", ".html", ".svelte", ".tsx", ".jsx"} and candidate.is_file():
+                if "</head>" in candidate.read_text(encoding="utf-8"):
+                    layouts.append(candidate)
+    if len(layouts) == 1:
+        return layouts[0]
+    if len(layouts) > 1:
+        names = ", ".join(str(path.relative_to(root)) for path in layouts)
+        raise SetupError(f"Multiple shared head files found ({names}); pass --target.")
+    raise SetupError("Could not find a shared file containing </head>; pass --target.")
+
+
+def plan_integration(target: Path, domain: str, base_url: str) -> tuple[str, str]:
+    before = target.read_text(encoding="utf-8")
+    tracker_url = f"{base_url}/js/script.js"
+    inline = " is:inline" if target.suffix == ".astro" else ""
+    expected = f'<script{inline} defer data-domain="{domain}" src="{tracker_url}"></script>'
+    if expected in before:
+        return before, before
+    if re.search(r"<script[^>]+(?:plausible|data-domain=)", before, flags=re.IGNORECASE):
+        raise SetupError(f"An existing analytics script in {target} needs manual review; refusing to duplicate it.")
+    match = re.search(r"(?m)^(?P<indent>[ \t]*)</head>", before)
+    if not match:
+        raise SetupError(f"Target file has no standalone </head> closing tag: {target}")
+    indent = match.group("indent") + "  "
+    snippet = f"{indent}<!-- Plausible Analytics -->\n{indent}{expected}\n"
+    return before, before[: match.start()] + snippet + before[match.start() :]
+
+
+def print_diff(target: Path, root: Path, before: str, after: str) -> None:
+    label = str(target.relative_to(root))
+    sys.stdout.writelines(
+        difflib.unified_diff(
+            before.splitlines(keepends=True),
+            after.splitlines(keepends=True),
+            fromfile=f"a/{label}",
+            tofile=f"b/{label}",
+        )
+    )
+
+
+def logged_in_session(base_url: str, login_service: str) -> PlausibleSession:
+    email, password = load_login_credentials(login_service)
+    try:
+        session = PlausibleSession(base_url)
+        session.login(email, password)
+        return session
+    finally:
+        password = ""
+
+
+def ensure_stats_key(
+    base_url: str,
+    login_service: str,
+    stats_service: str,
+    *,
+    refresh: bool = False,
+    name: str = "Plausible CLI",
+) -> tuple[str, str]:
+    if not refresh:
+        try:
+            return keychain_secret(stats_service), "already stored"
+        except MissingKeychainItem:
+            pass
+    session = logged_in_session(base_url, login_service)
+    key = session.create_stats_key(name)
+    store_generated_secret(stats_service, "stats-api", key)
+    return key, "created"
+
+
+def stats_query(
+    base_url: str,
+    key: str,
+    domain: str,
+    period: str | list[str],
+    metrics: list[str],
+    *,
+    dimensions: list[str] | None = None,
+    filters: list[object] | None = None,
+    limit: int = 10,
+) -> dict[str, object]:
+    body: dict[str, object] = {
+        "site_id": domain,
+        "date_range": period,
+        "metrics": metrics,
+        "pagination": {"limit": limit, "offset": 0},
+    }
+    if dimensions:
+        body["dimensions"] = dimensions
+    if filters:
+        body["filters"] = filters
+    _, _, raw = request_url(
+        f"{base_url}/api/v2/query",
+        method="POST",
+        json_body=body,
+        headers={"Authorization": f"Bearer {key}"},
+    )
+    try:
+        parsed = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SetupError("Plausible returned an invalid Stats API response.") from exc
+    if not isinstance(parsed, dict):
+        raise SetupError("Plausible returned an unexpected Stats API response.")
+    return parsed
+
+
+def previous_period_range(period: str, today: date | None = None) -> list[str]:
+    current_day = today or date.today()
+    relative_days = {
+        "day": 1,
+        "7d": 7,
+        "28d": 28,
+        "30d": 30,
+        "91d": 91,
+    }
+    if period in relative_days:
+        days = relative_days[period]
+        current_start = current_day - timedelta(days=days - 1)
+    elif period == "month":
+        current_start = current_day.replace(day=1)
+        days = (current_day - current_start).days + 1
+    elif period == "year":
+        current_start = current_day.replace(month=1, day=1)
+        days = (current_day - current_start).days + 1
+    else:
+        match = re.fullmatch(r"(\d+)d", period)
+        if not match:
+            raise SetupError(
+                "--compare previous supports day, Nd, month, or year periods."
+            )
+        days = int(match.group(1))
+        if days < 1 or days > 3660:
+            raise SetupError("The comparison period must be between 1 and 3660 days.")
+        current_start = current_day - timedelta(days=days - 1)
+    previous_end = current_start - timedelta(days=1)
+    previous_start = previous_end - timedelta(days=days - 1)
+    return [previous_start.isoformat(), previous_end.isoformat()]
+
+
+def build_report(
+    base_url: str,
+    key: str,
+    domain: str,
+    period: str,
+    limit: int,
+    *,
+    compare: str | None = None,
+) -> dict[str, object]:
+    report: dict[str, object] = {
+        "domain": domain,
+        "period": period,
+        "summary": stats_query(base_url, key, domain, period, DEFAULT_METRICS, limit=1),
+        "pages": stats_query(
+            base_url,
+            key,
+            domain,
+            period,
+            ["visitors", "pageviews"],
+            dimensions=["event:page"],
+            limit=limit,
+        ),
+        "sources": stats_query(
+            base_url,
+            key,
+            domain,
+            period,
+            ["visitors"],
+            dimensions=["visit:source"],
+            limit=limit,
+        ),
+        "goals": stats_query(
+            base_url,
+            key,
+            domain,
+            period,
+            ["events", "conversion_rate"],
+            dimensions=["event:goal"],
+            limit=limit,
+        ),
+    }
+    if compare == "previous":
+        previous_range = previous_period_range(period)
+        report["comparison"] = {
+            "period": previous_range,
+            "summary": stats_query(
+                base_url,
+                key,
+                domain,
+                previous_range,
+                DEFAULT_METRICS,
+                limit=1,
+            ),
+        }
+    return report
+
+
+def resolve_breakdown_dimension(value: str) -> tuple[str, str]:
+    normalized = value.strip().lower()
+    if normalized.startswith("prop:") and len(normalized) > len("prop:"):
+        name = normalized.removeprefix("prop:")
+        if not re.fullmatch(r"[a-z0-9_.-]+", name):
+            raise SetupError("Custom property names may contain letters, numbers, dots, dashes, and underscores.")
+        return value, f"event:props:{name}"
+    dimension = BREAKDOWN_DIMENSIONS.get(normalized)
+    if not dimension:
+        choices = ", ".join(sorted(BREAKDOWN_DIMENSIONS))
+        raise SetupError(f"Unknown breakdown {value!r}. Use one of: {choices}, or prop:NAME.")
+    return normalized, dimension
+
+
+def parse_breakdown_filters(values: list[str] | None) -> list[object]:
+    filters: list[object] = []
+    for item in values or []:
+        if "=" not in item:
+            raise SetupError("--filter must use NAME=VALUE, such as source=Google.")
+        name, value = item.split("=", 1)
+        _, dimension = resolve_breakdown_dimension(name)
+        value = value.strip()
+        if not value:
+            raise SetupError("--filter values cannot be empty.")
+        if "*" in value:
+            filters.append(["contains", dimension, [value.replace("*", "")]])
+        else:
+            filters.append(["is", dimension, [value]])
+    return filters
+
+
+def build_breakdown(
+    base_url: str,
+    key: str,
+    domain: str,
+    period: str,
+    by: str,
+    limit: int,
+    filter_values: list[str] | None = None,
+) -> dict[str, object]:
+    label, dimension = resolve_breakdown_dimension(by)
+    metrics = (
+        ["events", "conversion_rate"]
+        if dimension == "event:goal"
+        else ["visitors", "pageviews"]
+        if dimension == "event:page"
+        else ["visitors", "percentage"]
+    )
+    return {
+        "domain": domain,
+        "period": period,
+        "breakdown": label,
+        "dimension": dimension,
+        "metrics": metrics,
+        "results": stats_query(
+            base_url,
+            key,
+            domain,
+            period,
+            metrics,
+            dimensions=[dimension],
+            filters=parse_breakdown_filters(filter_values),
+            limit=limit,
+        ),
+    }
+
+
+def result_rows(query_response: object) -> list[dict[str, object]]:
+    if not isinstance(query_response, dict):
+        return []
+    rows = query_response.get("results", [])
+    return rows if isinstance(rows, list) else []
+
+
+def metric_values(query_response: object, count: int) -> list[object]:
+    rows = result_rows(query_response)
+    metrics = rows[0].get("metrics", []) if rows else []
+    values = list(metrics) if isinstance(metrics, list) else []
+    return (values + [0] * count)[:count]
+
+
+def format_number(value: object) -> str:
+    if value is None:
+        return "0"
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, int):
+        return f"{value:,}"
+    if isinstance(value, float):
+        return f"{value:,.1f}" if not value.is_integer() else f"{int(value):,}"
+    return str(value)
+
+
+def format_duration(value: object) -> str:
+    try:
+        seconds = int(float(value))
+    except (TypeError, ValueError):
+        return "0s"
+    minutes, seconds = divmod(seconds, 60)
+    return f"{minutes}m {seconds}s" if minutes else f"{seconds}s"
+
+
+def format_report(report: dict[str, object]) -> str:
+    values = metric_values(report["summary"], len(DEFAULT_METRICS))
+    lines = [
+        f"Plausible report for {report['domain']} ({report['period']})",
+        "",
+        f"Visitors: {format_number(values[0])}  Visits: {format_number(values[1])}  Pageviews: {format_number(values[2])}",
+        f"Bounce rate: {format_number(values[3])}%  Average visit: {format_duration(values[4])}",
+    ]
+
+    comparison = report.get("comparison")
+    if isinstance(comparison, dict):
+        previous = metric_values(comparison.get("summary"), len(DEFAULT_METRICS))
+        period = comparison.get("period", [])
+        period_label = " to ".join(str(item) for item in period) if isinstance(period, list) else str(period)
+        lines.extend(["", f"Compared with {period_label}"])
+        for index, label in enumerate(("Visitors", "Visits", "Pageviews")):
+            current_value = float(values[index] or 0)
+            previous_value = float(previous[index] or 0)
+            if previous_value == 0:
+                change = "new" if current_value else "0%"
+            else:
+                change = f"{((current_value - previous_value) / previous_value) * 100:+.1f}%"
+            lines.append(
+                f"  {label}: {format_number(values[index])} vs {format_number(previous[index])} ({change})"
+            )
+
+    sections = [
+        ("Top pages", report["pages"], ("Visitors", "Pageviews")),
+        ("Top sources", report["sources"], ("Visitors",)),
+        ("Goals", report["goals"], ("Conversions", "Conversion rate")),
+    ]
+    for title, response, headings in sections:
+        lines.extend(["", title])
+        rows = result_rows(response)
+        if not rows:
+            lines.append("  No data")
+            continue
+        for row in rows:
+            dimensions = row.get("dimensions", [])
+            label = str(dimensions[0] if dimensions else "(unknown)")
+            row_metrics = row.get("metrics", [])
+            formatted = []
+            for index, heading in enumerate(headings):
+                value = row_metrics[index] if index < len(row_metrics) else 0
+                suffix = "%" if "rate" in heading.lower() else ""
+                formatted.append(f"{heading.lower()} {format_number(value)}{suffix}")
+            lines.append(f"  {label}: {', '.join(formatted)}")
+    return "\n".join(lines)
+
+
+def report_sections(report: dict[str, object]) -> list[tuple[str, object, tuple[str, ...]]]:
+    return [
+        ("Top pages", report["pages"], ("Visitors", "Pageviews")),
+        ("Top sources", report["sources"], ("Visitors",)),
+        ("Goals", report["goals"], ("Conversions", "Conversion rate")),
+    ]
+
+
+def format_report_markdown(report: dict[str, object]) -> str:
+    values = metric_values(report["summary"], len(DEFAULT_METRICS))
+    lines = [
+        f"# Plausible report: {report['domain']}",
+        "",
+        f"Period: `{report['period']}`",
+        "",
+        "| Metric | Value |",
+        "| --- | ---: |",
+        f"| Visitors | {format_number(values[0])} |",
+        f"| Visits | {format_number(values[1])} |",
+        f"| Pageviews | {format_number(values[2])} |",
+        f"| Bounce rate | {format_number(values[3])}% |",
+        f"| Average visit | {format_duration(values[4])} |",
+    ]
+    comparison = report.get("comparison")
+    if isinstance(comparison, dict):
+        previous = metric_values(comparison.get("summary"), len(DEFAULT_METRICS))
+        period = comparison.get("period", [])
+        period_label = " to ".join(str(item) for item in period) if isinstance(period, list) else str(period)
+        lines.extend([
+            "",
+            "## Previous period",
+            "",
+            f"Compared with `{period_label}`.",
+            "",
+            "| Metric | Current | Previous | Change |",
+            "| --- | ---: | ---: | ---: |",
+        ])
+        for index, label in enumerate(("Visitors", "Visits", "Pageviews")):
+            current_value = float(values[index] or 0)
+            previous_value = float(previous[index] or 0)
+            change = "new" if previous_value == 0 and current_value else "0%" if previous_value == 0 else f"{((current_value - previous_value) / previous_value) * 100:+.1f}%"
+            lines.append(f"| {label} | {format_number(values[index])} | {format_number(previous[index])} | {change} |")
+    for title, response, headings in report_sections(report):
+        lines.extend(["", f"## {title}", ""])
+        rows = result_rows(response)
+        if not rows:
+            lines.append("No data.")
+            continue
+        lines.append("| Name | " + " | ".join(headings) + " |")
+        lines.append("| --- | " + " | ".join("---:" for _ in headings) + " |")
+        for row in rows:
+            dimensions = row.get("dimensions", [])
+            label = str(dimensions[0] if dimensions else "(unknown)").replace("|", "\\|")
+            metrics = row.get("metrics", [])
+            values_text = []
+            for index, heading in enumerate(headings):
+                value = metrics[index] if isinstance(metrics, list) and index < len(metrics) else 0
+                suffix = "%" if "rate" in heading.lower() else ""
+                values_text.append(format_number(value) + suffix)
+            lines.append("| " + label + " | " + " | ".join(values_text) + " |")
+    return "\n".join(lines)
+
+
+def format_report_csv(report: dict[str, object]) -> str:
+    output = io.StringIO(newline="")
+    writer = csv.writer(output)
+    writer.writerow(["section", "name", "metric", "value"])
+    values = metric_values(report["summary"], len(DEFAULT_METRICS))
+    for metric, value in zip(DEFAULT_METRICS, values):
+        writer.writerow(["summary", "", metric, value])
+    comparison = report.get("comparison")
+    if isinstance(comparison, dict):
+        previous = metric_values(comparison.get("summary"), len(DEFAULT_METRICS))
+        for metric, value in zip(DEFAULT_METRICS, previous):
+            writer.writerow(["previous", "", metric, value])
+    for title, response, headings in report_sections(report):
+        section = title.lower().replace(" ", "_")
+        for row in result_rows(response):
+            dimensions = row.get("dimensions", [])
+            label = str(dimensions[0] if dimensions else "(unknown)")
+            metrics = row.get("metrics", [])
+            for index, heading in enumerate(headings):
+                value = metrics[index] if isinstance(metrics, list) and index < len(metrics) else 0
+                writer.writerow([section, label, heading.lower().replace(" ", "_"), value])
+    return output.getvalue().rstrip("\r\n")
+
+
+def breakdown_rows(breakdown: dict[str, object]) -> list[tuple[str, list[object]]]:
+    rows: list[tuple[str, list[object]]] = []
+    for row in result_rows(breakdown["results"]):
+        dimensions = row.get("dimensions", [])
+        label = str(dimensions[0] if dimensions else "(unknown)")
+        metrics = row.get("metrics", [])
+        rows.append((label, list(metrics) if isinstance(metrics, list) else []))
+    return rows
+
+
+def format_breakdown(breakdown: dict[str, object], output_format: str) -> str:
+    metrics = [str(item) for item in breakdown["metrics"]]
+    rows = breakdown_rows(breakdown)
+    if output_format == "json":
+        return json.dumps(breakdown, indent=2)
+    if output_format == "csv":
+        output = io.StringIO(newline="")
+        writer = csv.writer(output)
+        writer.writerow([str(breakdown["breakdown"]), *metrics])
+        for label, values in rows:
+            writer.writerow([label, *values])
+        return output.getvalue().rstrip("\r\n")
+    if output_format == "markdown":
+        lines = [
+            f"# Plausible breakdown: {breakdown['domain']}",
+            "",
+            f"Period: `{breakdown['period']}` · By: `{breakdown['breakdown']}`",
+            "",
+            "| Name | " + " | ".join(metrics) + " |",
+            "| --- | " + " | ".join("---:" for _ in metrics) + " |",
+        ]
+        for label, values in rows:
+            lines.append("| " + label.replace("|", "\\|") + " | " + " | ".join(format_number(value) for value in values) + " |")
+        if not rows:
+            lines.extend(["", "No data."])
+        return "\n".join(lines)
+    lines = [
+        f"Plausible breakdown for {breakdown['domain']} ({breakdown['period']}) by {breakdown['breakdown']}",
+        "",
+    ]
+    if not rows:
+        lines.append("No data")
+    for label, values in rows:
+        rendered = ", ".join(
+            f"{metric.replace('_', ' ')} {format_number(values[index] if index < len(values) else 0)}"
+            for index, metric in enumerate(metrics)
+        )
+        lines.append(f"  {label}: {rendered}")
+    return "\n".join(lines)
+
+
+def plugin_token_help(base_url: str, domain: str) -> str:
+    encoded_domain = urllib.parse.quote(domain, safe="")
+    query = urllib.parse.urlencode({"new_token": "Plausible CLI"})
+    return f"{base_url}/{encoded_domain}/settings/integrations?{query}"
+
+
+def plugin_api_request(
+    base_url: str,
+    domain: str,
+    token: str,
+    path: str,
+    *,
+    method: str = "GET",
+    body: object | None = None,
+) -> object | None:
+    encoded = base64.b64encode(f"{domain}:{token}".encode("utf-8")).decode("ascii")
+    _, status, raw = request_url(
+        f"{base_url}{path}",
+        method=method,
+        json_body=body,
+        headers={"Authorization": f"Basic {encoded}"},
+    )
+    if status == 204 or not raw:
+        return None
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SetupError("Plausible returned an invalid Plugins API response.") from exc
+
+
+def list_goals(base_url: str, domain: str, token: str) -> list[dict[str, object]]:
+    response = plugin_api_request(base_url, domain, token, "/api/plugins/v1/goals?limit=100")
+    if not isinstance(response, dict) or not isinstance(response.get("goals"), list):
+        raise SetupError("Plausible returned an unexpected goals response.")
+    return response["goals"]
+
+
+def goal_line(item: dict[str, object]) -> str:
+    goal = item.get("goal", {})
+    if not isinstance(goal, dict):
+        return "unknown goal"
+    goal_type = str(item.get("goal_type", "Goal"))
+    type_label = goal_type.removeprefix("Goal.")
+    value = goal.get("event_name") or goal.get("path") or goal.get("display_name") or ""
+    return f"{goal.get('id', '?')}  {type_label}  {goal.get('display_name', value)}  ({value})"
+
+
+def goal_token(base_url: str, host: str, root_value: str, domain_arg: str | None, service_arg: str | None) -> tuple[str, str, str]:
+    _, domain = resolve_domain(root_value, domain_arg)
+    service = service_arg or f"plausible-plugin:{host}:{domain}"
+    try:
+        token = keychain_secret(service)
+    except MissingKeychainItem as exc:
+        url = plugin_token_help(base_url, domain)
+        raise SetupError(
+            f"No plugin token is stored for {domain}. Create one at {url}, then run "
+            f"`plausible-setup plugin-token --domain {domain}` in a terminal."
+        ) from exc
+    return domain, service, token
+
+
+def doctor_check(checks: list[dict[str, str]], name: str, status: str, detail: str) -> None:
+    checks.append({"name": name, "status": status, "detail": detail})
+
+
+def build_doctor_report(
+    base_url: str,
+    host: str,
+    login_service: str,
+    stats_service: str,
+    root_value: str,
+    domain_arg: str | None,
+    target_arg: str | None,
+    plugin_service_arg: str | None,
+) -> dict[str, object]:
+    root, domain = resolve_domain(root_value, domain_arg)
+    checks: list[dict[str, str]] = []
+
+    try:
+        _, status, _ = request_url(f"{base_url}/api/health")
+        doctor_check(checks, "instance", "pass", f"{base_url} responded with HTTP {status}")
+    except SetupError as exc:
+        doctor_check(checks, "instance", "fail", str(exc))
+
+    try:
+        _, status, _ = request_url(f"{base_url}/js/script.js")
+        doctor_check(checks, "tracker-endpoint", "pass", f"tracker script responded with HTTP {status}")
+    except SetupError as exc:
+        doctor_check(checks, "tracker-endpoint", "fail", str(exc))
+
+    try:
+        target = resolve_target(root, target_arg)
+        before, after = plan_integration(target, domain, base_url)
+        if before == after:
+            doctor_check(checks, "project-tracker", "pass", f"installed in {target.relative_to(root)}")
+        else:
+            doctor_check(checks, "project-tracker", "fail", f"missing from {target.relative_to(root)}")
+    except SetupError as exc:
+        doctor_check(checks, "project-tracker", "fail", str(exc))
+
+    try:
+        session = logged_in_session(base_url, login_service)
+        if session.site_exists(domain):
+            doctor_check(checks, "property", "pass", f"{domain} exists")
+        else:
+            doctor_check(checks, "property", "fail", f"{domain} does not exist")
+    except SetupError as exc:
+        doctor_check(checks, "property", "fail", str(exc))
+
+    try:
+        key = keychain_secret(stats_service)
+    except MissingKeychainItem:
+        doctor_check(checks, "stats-api", "warn", "no Stats API key is stored; run a report to create one")
+    except SetupError as exc:
+        doctor_check(checks, "stats-api", "fail", str(exc))
+    else:
+        try:
+            response = stats_query(base_url, key, domain, "day", ["visitors"], limit=1)
+            visitors = metric_values(response, 1)[0]
+            doctor_check(checks, "stats-api", "pass", f"query succeeded; visitors today: {format_number(visitors)}")
+        except SetupError as exc:
+            doctor_check(checks, "stats-api", "fail", str(exc))
+
+    plugin_service = plugin_service_arg or f"plausible-plugin:{host}:{domain}"
+    try:
+        token = keychain_secret(plugin_service)
+    except MissingKeychainItem:
+        doctor_check(checks, "plugins-api", "warn", "no site plugin token is stored; goal writes are unavailable")
+    except SetupError as exc:
+        doctor_check(checks, "plugins-api", "fail", str(exc))
+    else:
+        try:
+            goals = list_goals(base_url, domain, token)
+            doctor_check(checks, "plugins-api", "pass", f"query succeeded; configured goals: {len(goals)}")
+        except SetupError as exc:
+            doctor_check(checks, "plugins-api", "fail", str(exc))
+
+    return {
+        "domain": domain,
+        "plausible_url": base_url,
+        "ok": not any(check["status"] == "fail" for check in checks),
+        "checks": checks,
+    }
+
+
+def format_doctor(report: dict[str, object]) -> str:
+    symbols = {"pass": "PASS", "warn": "WARN", "fail": "FAIL"}
+    lines = [
+        f"Plausible doctor for {report['domain']}",
+        f"Instance: {report['plausible_url']}",
+        "",
+    ]
+    checks = report.get("checks", [])
+    for check in checks if isinstance(checks, list) else []:
+        if not isinstance(check, dict):
+            continue
+        status = str(check.get("status", "fail"))
+        lines.append(
+            f"{symbols.get(status, status.upper()):4}  {check.get('name', 'check')}: {check.get('detail', '')}"
+        )
+    lines.extend(["", "Ready" if report.get("ok") else "Action required"])
+    return "\n".join(lines)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "command",
+        nargs="?",
+        choices=(
+            "configure",
+            "setup",
+            "credentials",
+            "doctor",
+            "stats-key",
+            "report",
+            "breakdown",
+            "plugin-token",
+            "goals-list",
+            "goal-add",
+            "goal-delete",
+        ),
+        default="setup",
+    )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
+    parser.add_argument(
+        "--plausible-url",
+        help=f"Self-hosted Plausible HTTPS origin (or set {PLAUSIBLE_URL_ENV})",
+    )
+    parser.add_argument("--keychain-service", help="Override the login Keychain service")
+    parser.add_argument("--stats-key-service", help="Override the Stats API Keychain service")
+    parser.add_argument("--plugin-token-service", help="Override the site plugin-token Keychain service")
+    parser.add_argument("--email", help="Account email for the credentials command")
+    parser.add_argument("--root", default=".", help="Project root (default: current directory)")
+    parser.add_argument("--domain")
+    parser.add_argument("--timezone")
+    parser.add_argument("--target", help="Shared layout or HTML file, relative to the project root")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--skip-provision", action="store_true")
+    parser.add_argument("--provision-only", action="store_true")
+    parser.add_argument("--refresh", action="store_true", help="Create and store a new Stats API key")
+    parser.add_argument("--name", default="Plausible CLI", help="Name for a generated Stats API key")
+    parser.add_argument("--period", default="7d", help="Stats date range (default: 7d)")
+    parser.add_argument("--limit", type=int, default=10, help="Rows per report section (default: 10)")
+    parser.add_argument("--compare", choices=("previous",), help="Compare a report with the previous period")
+    parser.add_argument("--by", help="Breakdown dimension, such as country, source, page, goal, or prop:plan")
+    parser.add_argument("--filter", action="append", dest="filters", help="Breakdown filter in NAME=VALUE form; repeatable")
+    parser.add_argument(
+        "--format",
+        choices=("text", "json", "csv", "markdown"),
+        default="text",
+        dest="output_format",
+        help="Report or breakdown output format (default: text)",
+    )
+    parser.add_argument("--json", action="store_true", dest="json_output")
+    goal_kind = parser.add_mutually_exclusive_group()
+    goal_kind.add_argument("--event", help="Custom event name for goal-add")
+    goal_kind.add_argument("--page", help="Page path for goal-add")
+    parser.add_argument("--goal-id", type=int, help="Goal ID for goal-delete")
+    parser.add_argument("--yes", action="store_true", help="Confirm goal deletion")
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    try:
+        if args.command == "configure":
+            value = args.plausible_url
+            if not value:
+                if not sys.stdin.isatty():
+                    raise SetupError("configure requires --plausible-url in a non-interactive terminal.")
+                value = input("Self-hosted Plausible URL (https://...): ").strip()
+            base_url = normalize_base_url(value)
+            path = save_configured_url(base_url)
+            print(f"Saved Plausible instance {base_url} in {path}.")
+            return 0
+
+        base_url = configured_base_url(args.plausible_url)
+        host = urllib.parse.urlparse(base_url).hostname
+        assert host
+        login_service = args.keychain_service or f"plausible:{host}"
+        stats_service = args.stats_key_service or f"plausible-stats:{host}"
+        output_format = "json" if args.json_output else args.output_format
+
+        if args.command == "credentials":
+            save_login_credentials(login_service, args.email)
+            return 0
+
+        if args.command == "stats-key":
+            _, status = ensure_stats_key(
+                base_url,
+                login_service,
+                stats_service,
+                refresh=args.refresh,
+                name=args.name,
+            )
+            print(f"Stats API key: {status} in Keychain service {stats_service}.")
+            return 0
+
+        if args.command == "doctor":
+            report = build_doctor_report(
+                base_url,
+                host,
+                login_service,
+                stats_service,
+                args.root,
+                args.domain,
+                args.target,
+                args.plugin_token_service,
+            )
+            print(json.dumps(report, indent=2) if output_format == "json" else format_doctor(report))
+            return 0 if report["ok"] else 1
+
+        if args.command == "report":
+            _, domain = resolve_domain(args.root, args.domain)
+            if args.limit < 1 or args.limit > 100:
+                raise SetupError("--limit must be between 1 and 100.")
+            key, key_status = ensure_stats_key(base_url, login_service, stats_service, name=args.name)
+            if key_status == "created":
+                print(f"Created and stored a Stats API key in {stats_service}.", file=sys.stderr)
+            report = build_report(
+                base_url,
+                key,
+                domain,
+                args.period,
+                args.limit,
+                compare=args.compare,
+            )
+            if output_format == "json":
+                rendered = json.dumps(report, indent=2)
+            elif output_format == "csv":
+                rendered = format_report_csv(report)
+            elif output_format == "markdown":
+                rendered = format_report_markdown(report)
+            else:
+                rendered = format_report(report)
+            print(rendered)
+            return 0
+
+        if args.command == "breakdown":
+            _, domain = resolve_domain(args.root, args.domain)
+            if not args.by:
+                raise SetupError("breakdown requires --by DIMENSION.")
+            if args.limit < 1 or args.limit > 100:
+                raise SetupError("--limit must be between 1 and 100.")
+            key, key_status = ensure_stats_key(base_url, login_service, stats_service, name=args.name)
+            if key_status == "created":
+                print(f"Created and stored a Stats API key in {stats_service}.", file=sys.stderr)
+            breakdown = build_breakdown(
+                base_url,
+                key,
+                domain,
+                args.period,
+                args.by,
+                args.limit,
+                args.filters,
+            )
+            print(format_breakdown(breakdown, output_format))
+            return 0
+
+        if args.command == "plugin-token":
+            _, domain = resolve_domain(args.root, args.domain)
+            service = args.plugin_token_service or f"plausible-plugin:{host}:{domain}"
+            print(f"Create a plugin token first if needed: {plugin_token_help(base_url, domain)}")
+            prompt_store_secret(service, domain, "Plausible plugin token")
+            print(f"Saved the plugin token in Keychain service {service}.")
+            return 0
+
+        if args.command in {"goals-list", "goal-add", "goal-delete"}:
+            domain, _, token = goal_token(
+                base_url,
+                host,
+                args.root,
+                args.domain,
+                args.plugin_token_service,
+            )
+            if args.command == "goals-list":
+                goals = list_goals(base_url, domain, token)
+                print(json.dumps(goals, indent=2) if output_format == "json" else "\n".join(goal_line(goal) for goal in goals) or "No goals configured.")
+                return 0
+            if args.command == "goal-add":
+                if not args.event and not args.page:
+                    raise SetupError("goal-add requires either --event NAME or --page PATH.")
+                payload = (
+                    {"goal_type": "Goal.CustomEvent", "goal": {"event_name": args.event}}
+                    if args.event
+                    else {"goal_type": "Goal.Pageview", "goal": {"path": args.page}}
+                )
+                response = plugin_api_request(
+                    base_url,
+                    domain,
+                    token,
+                    "/api/plugins/v1/goals",
+                    method="PUT",
+                    body=payload,
+                )
+                goals = response.get("goals", []) if isinstance(response, dict) else []
+                print("Goal ready: " + (goal_line(goals[0]) if goals else "created"))
+                return 0
+            if args.goal_id is None or not args.yes:
+                raise SetupError("goal-delete requires --goal-id ID and --yes.")
+            plugin_api_request(
+                base_url,
+                domain,
+                token,
+                f"/api/plugins/v1/goals/{args.goal_id}",
+                method="DELETE",
+            )
+            print(f"Deleted Plausible goal {args.goal_id} from {domain}.")
+            return 0
+
+        if args.skip_provision and args.provision_only:
+            raise SetupError("--skip-provision and --provision-only cannot be combined.")
+        root, domain = resolve_domain(args.root, args.domain)
+        timezone = args.timezone or infer_timezone()
+        target: Path | None = None
+        before = after = ""
+        if not args.provision_only:
+            target = resolve_target(root, args.target)
+            before, after = plan_integration(target, domain, base_url)
+            if before == after:
+                print(f"Tracker already installed for {domain} in {target.relative_to(root)}.")
+            else:
+                print_diff(target, root, before, after)
+        if args.dry_run:
+            if not args.skip_provision:
+                print(f"Dry run: would ensure Plausible property {domain} exists at {base_url}.")
+            return 0
+        if not args.skip_provision:
+            session = logged_in_session(base_url, login_service)
+            print(f"Plausible property {domain}: {session.ensure_site(domain, timezone)}.")
+        if target is not None and before != after:
+            target.write_text(after, encoding="utf-8")
+            print(f"Installed tracker in {target.relative_to(root)}.")
+        return 0
+    except SetupError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
