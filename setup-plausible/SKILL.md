@@ -46,23 +46,23 @@ For an existing instance, use `plausible`. Have the user run this in their
 interactive terminal, entering a Stats API key at the hidden prompt:
 
 ```bash
-plausible login --url https://plausible.example.com --site example.com
+plausible login --url https://plausible.example.com
 ```
 
-Never ask for a key in chat. Login validates access before storing the key in
-Keychain. Subsequent commands never create or rotate keys. JSON is the default:
+Never ask for a key in chat. Login stores the key in Keychain without selecting a website. API access is
+checked when requesting analytics. Subsequent commands never create or rotate keys. JSON is the default:
 
 ```bash
 plausible status
-plausible report --period 30d --compare previous
-plausible breakdown --by page --filter source=Google
-plausible timeseries --period 30d
-plausible realtime
-plausible query --file query.json
+plausible report --site example.com --period 30d --compare previous
+plausible breakdown --site example.com --by page --filter source=Google
+plausible timeseries --site example.com --period 30d
+plausible realtime --site example.com
+plausible query --site example.com --file query.json
 plausible capabilities --json
 ```
 
-Use `--site` to select another accessible website. `query` accepts the complete
+Use `--site` to select the website for each analytics request. `query` accepts the complete
 Stats API v2 body, including custom dates, filters, ordering, and pagination.
 The API key controls access; the CLI cannot list sites through the Stats API.
 `logout` removes CLI configuration and keeps the shared Keychain item.

@@ -35,19 +35,14 @@ class CLI(unittest.TestCase):
             with self.assertRaises(cli.backend.SetupError):
                 cli.origin(value)
 
-    def test_login_checks_before_storing(self):
-        with patch.object(cli.sys.stdin, 'isatty', return_value=True), patch.object(cli.getpass, 'getpass', return_value='private-key'), patch.object(cli, 'query', side_effect=cli.backend.SetupError('Plausible returned HTTP 401.')), patch.object(cli.backend, 'store_generated_secret') as store:
-            code, out, err = self.invoke(['login', '--url', 'https://plausible.example.com', '--site', 'example.com'])
-        self.assertEqual(code, 1)
-        store.assert_not_called()
-        self.assertNotIn('private-key', out + err)
-
     def test_login_saves_only_public_config(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'config.json'
-            with patch.object(cli, 'config_path', return_value=path), patch.object(cli.sys.stdin, 'isatty', return_value=True), patch.object(cli.getpass, 'getpass', return_value='private-key'), patch.object(cli, 'query', return_value={'results': []}), patch.object(cli.backend, 'store_generated_secret') as store:
-                code, out, err = self.invoke(['login', '--url', 'https://plausible.example.com', '--site', 'example.com'])
+            with patch.object(cli, 'config_path', return_value=path), patch.object(cli.sys.stdin, 'isatty', return_value=True), patch.object(cli.getpass, 'getpass', return_value='private-key'), patch.object(cli, 'query', side_effect=AssertionError('Login must not query a site')), patch.object(cli.backend, 'store_generated_secret') as store:
+                code, out, err = self.invoke(['login', '--url', 'https://plausible.example.com'])
             self.assertEqual(code, 0)
+            self.assertEqual(json.loads(path.read_text()), {'url': 'https://plausible.example.com'})
+            self.assertFalse(json.loads(out)['access_verified'])
             self.assertNotIn('private-key', path.read_text() + out + err)
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
             store.assert_called_once_with('plausible-stats:plausible.example.com', 'stats-api', 'private-key')
@@ -65,6 +60,30 @@ class CLI(unittest.TestCase):
             code, _, err = self.invoke(['report'])
         self.assertEqual(code, 1)
         self.assertIn('Run plausible login', err)
+
+    def test_requests_after_login_without_site(self):
+        saved = {'url': 'https://plausible.example.com'}
+        with patch.object(cli, 'config', return_value=saved), patch.object(cli.backend, 'keychain_secret', return_value='secret'), patch.object(cli, 'query', return_value={'results': []}) as query:
+            code, out, _ = self.invoke(['status'])
+            self.assertEqual(code, 0)
+            self.assertFalse(json.loads(out)['access_verified'])
+            query.assert_not_called()
+            code, _, err = self.invoke(['report'])
+            self.assertEqual(code, 1)
+            self.assertIn('--site', err)
+            with patch.object(cli.backend, 'build_report', return_value={}) as report:
+                self.assertEqual(self.invoke(['report', '--site', 'example.com'])[0], 0)
+                self.assertEqual(report.call_args.args[2], 'example.com')
+            with patch.object(cli.sys, 'stdin', io.StringIO('{"site_id":"other.com","date_range":"7d","metrics":["visitors"]}')):
+                self.assertEqual(self.invoke(['query', '--file', '-'])[0], 0)
+                self.assertEqual(query.call_args.args[2]['site_id'], 'other.com')
+
+    def test_url_only_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'config.json'
+            path.write_text('{"url":"https://plausible.example.com"}')
+            with patch.object(cli, 'config_path', return_value=path):
+                self.assertEqual(cli.config(), {'url': 'https://plausible.example.com'})
 
     def test_timeseries_default_keeps_month(self):
         self.assertEqual(cli.parser().parse_args(['timeseries', '--period', '30d']).limit, 10000)

@@ -17,21 +17,21 @@ loader = importlib.machinery.SourceFileLoader('plausible_setup', str(Path(__file
 spec = importlib.util.spec_from_loader(loader.name, loader)
 backend = importlib.util.module_from_spec(spec)
 loader.exec_module(backend)
-VERSION = '1.1.0'
+VERSION = '1.1.1'
 MANIFEST = {
     'name': 'plausible', 'version': VERSION,
     'summary': 'Read reports and query analytics from a self-hosted Plausible instance.',
     'capabilities': [
-        {'description': 'Save a Stats API key securely in macOS Keychain', 'command': 'plausible login --url https://plausible.example.com --site example.com'},
-        {'description': 'Check saved authentication with a read-only request', 'command': 'plausible status'},
-        {'description': 'Report traffic, top pages, sources and conversions', 'command': 'plausible report --period 30d --compare previous'},
-        {'description': 'Break down traffic by page, source, country, device or custom property', 'command': 'plausible breakdown --by country --period 30d'},
-        {'description': 'Read traffic over time', 'command': 'plausible timeseries --period 30d --interval day'},
-        {'description': 'Read current visitors', 'command': 'plausible realtime'},
-        {'description': 'Query any Stats API metrics, dimensions, filters and pagination', 'command': 'plausible query --file query.json'},
-        {'description': 'Export reports as JSON, CSV, Markdown or text', 'command': 'plausible report --format csv'}
+        {'description': 'Save a Stats API key securely in macOS Keychain', 'command': 'plausible login --url https://plausible.example.com'},
+        {'description': 'Check whether API credentials are saved', 'command': 'plausible status'},
+        {'description': 'Report traffic, top pages, sources and conversions', 'command': 'plausible report --site example.com --period 30d --compare previous'},
+        {'description': 'Break down traffic by page, source, country, device or custom property', 'command': 'plausible breakdown --site example.com --by country --period 30d'},
+        {'description': 'Read traffic over time', 'command': 'plausible timeseries --site example.com --period 30d --interval day'},
+        {'description': 'Read current visitors', 'command': 'plausible realtime --site example.com'},
+        {'description': 'Query any Stats API metrics, dimensions, filters and pagination', 'command': 'plausible query --site example.com --file query.json'},
+        {'description': 'Export reports as JSON, CSV, Markdown or text', 'command': 'plausible report --site example.com --format csv'}
     ],
-    'changelog': [{'version': VERSION, 'date': '2026-10-23', 'changes': ['Added plausible with API-key login, reports, breakdowns, time series, realtime and full Stats API queries.']}]
+    'changelog': [{'version': VERSION, 'date': '2026-10-23', 'changes': ['Removed website selection from login; select websites on analytics commands.']}, {'version': '1.1.0', 'date': '2026-10-23', 'changes': ['Added plausible with API-key login, reports, breakdowns, time series, realtime and full Stats API queries.']}]
 }
 
 
@@ -74,13 +74,16 @@ def config_path():
 def config():
     try:
         saved = json.loads(config_path().read_text())
-        if not isinstance(saved, dict) or not isinstance(saved.get('url'), str) or not isinstance(saved.get('site'), str):
+        if not isinstance(saved, dict) or not isinstance(saved.get('url'), str):
             raise ValueError()
         saved['url'] = origin(saved['url'])
-        saved['site'] = backend.validate_domain(saved['site'])
+        if 'site' in saved:
+            if not isinstance(saved['site'], str):
+                raise ValueError()
+            saved['site'] = backend.validate_domain(saved['site'])
         return saved
     except FileNotFoundError:
-        raise backend.SetupError('Run plausible login --url https://plausible.example.com --site example.com first.') from None
+        raise backend.SetupError('Run plausible login --url https://plausible.example.com first.') from None
     except (OSError, ValueError):
         raise backend.SetupError('Could not read the Plausible CLI configuration.') from None
 
@@ -116,14 +119,13 @@ def parser():
     commands = p.add_subparsers(dest='command', required=True)
     cap = commands.add_parser('capabilities', help='Discover agent tasks and releases, without authentication')
     cap.add_argument('--json', action='store_true')
-    login = commands.add_parser('login', help='Validate and save a Stats API key from a hidden prompt')
+    login = commands.add_parser('login', help='Save a Stats API key from a hidden prompt; access is checked on analytics requests')
     login.add_argument('--url', required=True)
-    login.add_argument('--site', required=True)
-    commands.add_parser('status', help='Check saved credentials with a read-only query')
+    commands.add_parser('status', help='Check whether API credentials are saved; does not verify API access')
     commands.add_parser('logout', help='Remove CLI configuration; keep the shared Keychain key')
     for name, help_text in [('report', 'Traffic summary, pages, sources and goals'), ('breakdown', 'Group traffic by a dimension'), ('timeseries', 'Traffic over time'), ('realtime', 'Current visitors'), ('query', 'Send a complete Stats API v2 query')]:
         sub = commands.add_parser(name, help=help_text)
-        sub.add_argument('--site', help='Override the website saved at login')
+        sub.add_argument('--site', help='Website to query (required unless the query file supplies site_id or legacy config has a default)')
         if name == 'query':
             sub.add_argument('--file', required=True, help='JSON query file, or - for stdin; supports all Stats API v2 options')
             continue
@@ -158,28 +160,30 @@ def main(argv=None):
                     print(f'{release["version"]} ({release["date"]}): ' + '; '.join(release['changes']))
             return 0
         if args.command == 'login':
-            url, site = origin(args.url), backend.validate_domain(args.site)
+            url = origin(args.url)
             if not sys.stdin.isatty():
                 raise backend.SetupError('Run plausible login in an interactive terminal. Never paste the key into chat.')
             print('Create a Stats API key in your Plausible account settings, then paste it below.', file=sys.stderr)
             key = getpass.getpass('Stats API key (hidden): ').strip()
             if not key or any(c.isspace() for c in key):
                 raise backend.SetupError('Enter a nonempty API key without whitespace.')
-            query(url, key, {'site_id': site, 'date_range': 'day', 'metrics': ['visitors']})
             backend.store_generated_secret(service(url), 'stats-api', key)
             path = config_path()
             path.parent.mkdir(parents=True, exist_ok=True)
             fd, temporary = tempfile.mkstemp(dir=path.parent, prefix='.config-')
             try:
                 with os.fdopen(fd, 'w') as stream:
-                    json.dump({'url': url, 'site': site}, stream, indent=2)
+                    json.dump({'url': url}, stream, indent=2)
                 os.replace(temporary, path)
             finally:
                 Path(temporary).unlink(missing_ok=True)
-            print(json.dumps({'authenticated': True, 'url': url, 'site': site}))
+            print(json.dumps({'credentials_saved': True, 'url': url, 'access_verified': False}))
             return 0
         saved = config()
-        url, site = saved['url'], backend.validate_domain(getattr(args, 'site', None) or saved['site'])
+        url = saved['url']
+        site = getattr(args, 'site', None) or saved.get('site')
+        if site:
+            site = backend.validate_domain(site)
         if args.command == 'logout':
             config_path().unlink()
             print(json.dumps({'authenticated': False}))
@@ -189,16 +193,19 @@ def main(argv=None):
         except backend.MissingKeychainItem:
             raise backend.SetupError('No saved Stats API key. Run plausible login in your terminal.') from None
         if args.command == 'status':
-            query(url, key, {'site_id': site, 'date_range': 'day', 'metrics': ['visitors']})
-            result = {'authenticated': True, 'url': url, 'site': site}
+            result = {'credentials_saved': True, 'url': url, 'access_verified': False}
         elif args.command == 'query':
             raw = sys.stdin.read() if args.file == '-' else Path(args.file).read_text()
             body = json.loads(raw)
             if not isinstance(body, dict):
                 raise backend.SetupError('The query must be a JSON object.')
             if args.site or 'site_id' not in body:
+                if not site:
+                    raise backend.SetupError('Specify --site or include site_id in the query JSON.')
                 body['site_id'] = site
             result = query(url, key, body)
+        elif not site:
+            raise backend.SetupError('Specify the website with --site, for example --site example.com.')
         elif args.command == 'report':
             result = backend.build_report(url, key, site, args.period, args.limit, compare=args.compare)
         elif args.command == 'breakdown':

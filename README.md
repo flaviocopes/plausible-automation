@@ -525,26 +525,26 @@ just like `plausible-setup`. There are no extra packages to install.
 Run this once in your terminal:
 
 ```bash
-plausible login --url https://plausible.example.com --site example.com
+plausible login --url https://plausible.example.com
 ```
 
 Create a Stats API key in your Plausible account settings and paste it at the
-hidden prompt. Login checks access to the website before saving the key in
-Keychain. You can then let agents run reports without your dashboard password.
+hidden prompt. Login saves the key in Keychain. The first analytics request checks access
+to the selected website. You can then let agents run reports without your dashboard password.
 
 ```bash
 plausible status
-plausible report --period 30d --compare previous
-plausible breakdown --by country --period 30d
-plausible breakdown --by page --filter source=Google --format csv
-plausible timeseries --period 30d --interval day
-plausible realtime
+plausible report --site example.com --period 30d --compare previous
+plausible breakdown --site example.com --by country --period 30d
+plausible breakdown --site example.com --by page --filter source=Google --format csv
+plausible timeseries --site example.com --period 30d --interval day
+plausible realtime --site example.com
 plausible capabilities --json
 ```
 
 Results are JSON by default. Reports and breakdowns also accept `--format text`,
-`--format markdown`, and `--format csv`. Use `--site` to query another website
-accessible to the saved key. `status` makes a read-only request to verify access.
+`--format markdown`, and `--format csv`. Use `--site` to select a website accessible to the saved key. `status` checks
+that credentials are saved locally; it does not verify API access.
 
 For custom dates, multiple dimensions, complex filters, custom metrics, ordering,
 or pagination, save a complete [Stats API v2 query](https://plausible.io/docs/stats-api)
@@ -561,12 +561,12 @@ to a JSON file:
 ```
 
 ```bash
-plausible query --file query.json
-cat query.json | plausible query --file -
+plausible query --site example.com --file query.json
+cat query.json | plausible query --site example.com --file -
 ```
 
-The saved website fills in a missing `site_id`. An explicit `--site` overrides
-both the saved website and the file's `site_id`. Results keep the API response,
+Supply `site_id` in the query file or select a website with `--site`.
+An explicit `--site` overrides the file's `site_id`. Results keep the API response,
 including metadata and warnings. Use pagination to retrieve more rows.
 
 The available metrics and reports depend on your Community Edition version and
@@ -574,9 +574,10 @@ the data it collects. This is aggregate analytics, not individual visitor logs.
 Website discovery is outside the Stats API; supply the domains you want to query.
 
 Configuration lives in `~/.config/plausible/config.json` and contains only the
-instance URL and default website. `PLAUSIBLE_CLI_CONFIG` overrides this path.
+instance URL. Older configuration with a default website remains supported. `PLAUSIBLE_CLI_CONFIG` overrides this path.
 Keys use the same `plausible-stats:<host>` Keychain item as `plausible-setup`.
-Login replaces that instance's saved key only after validation. `plausible logout`
+Login stores the supplied key for that instance; API access is verified when
+you request analytics. `plausible logout`
 removes CLI configuration while keeping the shared key. Revoke keys in Plausible
 when you want to remove their API access.
 
@@ -587,6 +588,11 @@ keys or change the remote instance. The entry point reuses the existing reportin
 formatting, and Keychain implementation in its sibling `plausible-setup` script.
 
 ## Changelog
+
+### 1.1.1 (2026-10-23)
+
+- Removed website selection from login. Analytics commands select the website.
+- Made login and status distinguish saved credentials from verified API access.
 
 ### 1.1.0 (2026-10-23)
 
