@@ -17,7 +17,7 @@ loader = importlib.machinery.SourceFileLoader('plausible_setup', str(Path(__file
 spec = importlib.util.spec_from_loader(loader.name, loader)
 backend = importlib.util.module_from_spec(spec)
 loader.exec_module(backend)
-VERSION = '1.1.1'
+VERSION = '1.1.2'
 MANIFEST = {
     'name': 'plausible', 'version': VERSION,
     'summary': 'Read reports and query analytics from a self-hosted Plausible instance.',
@@ -31,7 +31,7 @@ MANIFEST = {
         {'description': 'Query any Stats API metrics, dimensions, filters and pagination', 'command': 'plausible query --site example.com --file query.json'},
         {'description': 'Export reports as JSON, CSV, Markdown or text', 'command': 'plausible report --site example.com --format csv'}
     ],
-    'changelog': [{'version': VERSION, 'date': '2026-10-23', 'changes': ['Removed website selection from login; select websites on analytics commands.']}, {'version': '1.1.0', 'date': '2026-10-23', 'changes': ['Added plausible with API-key login, reports, breakdowns, time series, realtime and full Stats API queries.']}]
+    'changelog': [{'version': VERSION, 'date': '2026-10-23', 'changes': ['Added clear login instructions and confirmation; use login --json for structured output.']}, {'version': '1.1.1', 'date': '2026-10-23', 'changes': ['Removed website selection from login; select websites on analytics commands.']}, {'version': '1.1.0', 'date': '2026-10-23', 'changes': ['Added plausible with API-key login, reports, breakdowns, time series, realtime and full Stats API queries.']}]
 }
 
 
@@ -121,6 +121,7 @@ def parser():
     cap.add_argument('--json', action='store_true')
     login = commands.add_parser('login', help='Save a Stats API key from a hidden prompt; access is checked on analytics requests')
     login.add_argument('--url', required=True)
+    login.add_argument('--json', action='store_true', help='Print the saved-credentials result as JSON')
     commands.add_parser('status', help='Check whether API credentials are saved; does not verify API access')
     commands.add_parser('logout', help='Remove CLI configuration; keep the shared Keychain key')
     for name, help_text in [('report', 'Traffic summary, pages, sources and goals'), ('breakdown', 'Group traffic by a dimension'), ('timeseries', 'Traffic over time'), ('realtime', 'Current visitors'), ('query', 'Send a complete Stats API v2 query')]:
@@ -163,7 +164,9 @@ def main(argv=None):
             url = origin(args.url)
             if not sys.stdin.isatty():
                 raise backend.SetupError('Run plausible login in an interactive terminal. Never paste the key into chat.')
-            print('Create a Stats API key in your Plausible account settings, then paste it below.', file=sys.stderr)
+            print(f'Connect to {url}\n', file=sys.stderr)
+            print('In Plausible, open your account settings → API Keys and create a Stats API key.', file=sys.stderr)
+            print('Paste it below. Your input stays hidden and the key is saved in macOS Keychain.\n', file=sys.stderr)
             key = getpass.getpass('Stats API key (hidden): ').strip()
             if not key or any(c.isspace() for c in key):
                 raise backend.SetupError('Enter a nonempty API key without whitespace.')
@@ -177,7 +180,13 @@ def main(argv=None):
                 os.replace(temporary, path)
             finally:
                 Path(temporary).unlink(missing_ok=True)
-            print(json.dumps({'credentials_saved': True, 'url': url, 'access_verified': False}))
+            if args.json:
+                print(json.dumps({'credentials_saved': True, 'url': url, 'access_verified': False}))
+            else:
+                print(f'\nAPI key saved in macOS Keychain for {url}.')
+                print('\nRequest a report by selecting a website tracked by this instance:')
+                print('  plausible report --site example.com --period 30d')
+                print('\nThe first analytics request will check the key and website access.')
             return 0
         saved = config()
         url = saved['url']

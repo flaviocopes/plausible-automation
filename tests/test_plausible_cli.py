@@ -42,10 +42,16 @@ class CLI(unittest.TestCase):
                 code, out, err = self.invoke(['login', '--url', 'https://plausible.example.com'])
             self.assertEqual(code, 0)
             self.assertEqual(json.loads(path.read_text()), {'url': 'https://plausible.example.com'})
-            self.assertFalse(json.loads(out)['access_verified'])
+            self.assertIn('API key saved in macOS Keychain', out)
+            self.assertIn('first analytics request', out)
+            self.assertIn('plausible report --site', out)
             self.assertNotIn('private-key', path.read_text() + out + err)
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
             store.assert_called_once_with('plausible-stats:plausible.example.com', 'stats-api', 'private-key')
+            with patch.object(cli, 'config_path', return_value=path), patch.object(cli.sys.stdin, 'isatty', return_value=True), patch.object(cli.getpass, 'getpass', return_value='private-key'), patch.object(cli.backend, 'store_generated_secret'):
+                code, out, _ = self.invoke(['login', '--url', 'https://plausible.example.com', '--json'])
+                self.assertEqual(code, 0)
+                self.assertFalse(json.loads(out)['access_verified'])
 
     def test_query_and_site_override(self):
         saved = {'url': 'https://plausible.example.com', 'site': 'example.com'}

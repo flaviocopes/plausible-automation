@@ -50,7 +50,8 @@ plausible login --url https://plausible.example.com
 ```
 
 Never ask for a key in chat. Login stores the key in Keychain without selecting a website. API access is
-checked when requesting analytics. Subsequent commands never create or rotate keys. JSON is the default:
+checked when requesting analytics. Login prints a readable confirmation; use
+`login --json` for structured output. Subsequent commands never create or rotate keys. JSON is the default:
 
 ```bash
 plausible status

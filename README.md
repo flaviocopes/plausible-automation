@@ -542,7 +542,9 @@ plausible realtime --site example.com
 plausible capabilities --json
 ```
 
-Results are JSON by default. Reports and breakdowns also accept `--format text`,
+Login prints a readable confirmation and a report command to try next. Use
+`plausible login --url https://plausible.example.com --json` for a structured result.
+Analytics results are JSON by default. Reports and breakdowns also accept `--format text`,
 `--format markdown`, and `--format csv`. Use `--site` to select a website accessible to the saved key. `status` checks
 that credentials are saved locally; it does not verify API access.
 
@@ -588,6 +590,11 @@ keys or change the remote instance. The entry point reuses the existing reportin
 formatting, and Keychain implementation in its sibling `plausible-setup` script.
 
 ## Changelog
+
+### 1.1.2 (2026-10-23)
+
+- Added readable login instructions, a saved-key confirmation and the next command.
+- Kept structured login output available through `--json`.
 
 ### 1.1.1 (2026-10-23)
 
