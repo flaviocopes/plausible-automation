@@ -43,6 +43,9 @@ rsync -a "$SKILL_SOURCE/" "$SKILL_DESTINATION/"
 install -m 755 "$SKILL_SOURCE/scripts/plausible-setup" "$BIN_DESTINATION/plausible-setup"
 install -m 755 "$SKILL_SOURCE/scripts/plausible-keychain-store" "$BIN_DESTINATION/plausible-keychain-store"
 
+install -m 755 "$SKILL_SOURCE/scripts/plausible" "$BIN_DESTINATION/plausible"
+
+echo "Installed CLI in $BIN_DESTINATION/plausible"
 echo "Installed Codex skill in $SKILL_DESTINATION"
 echo "Installed CLI in $BIN_DESTINATION/plausible-setup"
 

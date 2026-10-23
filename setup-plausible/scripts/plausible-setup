@@ -23,7 +23,7 @@ import urllib.parse
 import urllib.request
 
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 PLAUSIBLE_URL_ENV = "PLAUSIBLE_URL"
 CONFIG_PATH_ENV = "PLAUSIBLE_SETUP_CONFIG"
 DEFAULT_TIMEZONE = "UTC"

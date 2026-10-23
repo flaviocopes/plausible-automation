@@ -516,7 +516,84 @@ Tracker changes are visible before writes. Goal deletion needs an exact ID plus
 `--yes`. The CLI favors a stopped workflow over silent mutation when project
 layout, authentication, or remote responses are ambiguous.
 
+## Analytics CLI
+
+The installer also installs `plausible`. It reads an existing Plausible instance
+using a Stats API key you supply. It needs Python 3, macOS Keychain and Expect,
+just like `plausible-setup`. There are no extra packages to install.
+
+Run this once in your terminal:
+
+```bash
+plausible login --url https://plausible.example.com --site example.com
+```
+
+Create a Stats API key in your Plausible account settings and paste it at the
+hidden prompt. Login checks access to the website before saving the key in
+Keychain. You can then let agents run reports without your dashboard password.
+
+```bash
+plausible status
+plausible report --period 30d --compare previous
+plausible breakdown --by country --period 30d
+plausible breakdown --by page --filter source=Google --format csv
+plausible timeseries --period 30d --interval day
+plausible realtime
+plausible capabilities --json
+```
+
+Results are JSON by default. Reports and breakdowns also accept `--format text`,
+`--format markdown`, and `--format csv`. Use `--site` to query another website
+accessible to the saved key. `status` makes a read-only request to verify access.
+
+For custom dates, multiple dimensions, complex filters, custom metrics, ordering,
+or pagination, save a complete [Stats API v2 query](https://plausible.io/docs/stats-api)
+to a JSON file:
+
+```json
+{
+  "date_range": ["2026-09-01", "2026-09-30"],
+  "metrics": ["visitors", "pageviews"],
+  "dimensions": ["event:page"],
+  "order_by": [["visitors", "desc"]],
+  "pagination": {"limit": 100, "offset": 0}
+}
+```
+
+```bash
+plausible query --file query.json
+cat query.json | plausible query --file -
+```
+
+The saved website fills in a missing `site_id`. An explicit `--site` overrides
+both the saved website and the file's `site_id`. Results keep the API response,
+including metadata and warnings. Use pagination to retrieve more rows.
+
+The available metrics and reports depend on your Community Edition version and
+the data it collects. This is aggregate analytics, not individual visitor logs.
+Website discovery is outside the Stats API; supply the domains you want to query.
+
+Configuration lives in `~/.config/plausible/config.json` and contains only the
+instance URL and default website. `PLAUSIBLE_CLI_CONFIG` overrides this path.
+Keys use the same `plausible-stats:<host>` Keychain item as `plausible-setup`.
+Login replaces that instance's saved key only after validation. `plausible logout`
+removes CLI configuration while keeping the shared key. Revoke keys in Plausible
+when you want to remove their API access.
+
+Analytics requests require HTTPS and refuse redirects to protect the bearer key.
+Errors go to stderr as JSON and return a nonzero exit code. Keys never appear in
+arguments, output, configuration, or query files. Analytics commands never create
+keys or change the remote instance. The entry point reuses the existing reporting,
+formatting, and Keychain implementation in its sibling `plausible-setup` script.
+
 ## Changelog
+
+### 1.1.0 (2026-10-23)
+
+- Added `plausible` with API-key login, JSON reports, time series, realtime visitors,
+  full Stats API queries, and an agent capabilities manifest.
+- Kept API credentials in Keychain and refused analytics redirects.
+
 
 ### 1.0.0 (2026-08-06)
 

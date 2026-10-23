@@ -1,0 +1,235 @@
+#!/usr/bin/env python3
+"""Read Plausible analytics using a user-supplied Stats API key."""
+import argparse
+import getpass
+import importlib.machinery
+import importlib.util
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+
+loader = importlib.machinery.SourceFileLoader('plausible_setup', str(Path(__file__).resolve().with_name('plausible-setup')))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+backend = importlib.util.module_from_spec(spec)
+loader.exec_module(backend)
+VERSION = '1.1.0'
+MANIFEST = {
+    'name': 'plausible', 'version': VERSION,
+    'summary': 'Read reports and query analytics from a self-hosted Plausible instance.',
+    'capabilities': [
+        {'description': 'Save a Stats API key securely in macOS Keychain', 'command': 'plausible login --url https://plausible.example.com --site example.com'},
+        {'description': 'Check saved authentication with a read-only request', 'command': 'plausible status'},
+        {'description': 'Report traffic, top pages, sources and conversions', 'command': 'plausible report --period 30d --compare previous'},
+        {'description': 'Break down traffic by page, source, country, device or custom property', 'command': 'plausible breakdown --by country --period 30d'},
+        {'description': 'Read traffic over time', 'command': 'plausible timeseries --period 30d --interval day'},
+        {'description': 'Read current visitors', 'command': 'plausible realtime'},
+        {'description': 'Query any Stats API metrics, dimensions, filters and pagination', 'command': 'plausible query --file query.json'},
+        {'description': 'Export reports as JSON, CSV, Markdown or text', 'command': 'plausible report --format csv'}
+    ],
+    'changelog': [{'version': VERSION, 'date': '2026-10-23', 'changes': ['Added plausible with API-key login, reports, breakdowns, time series, realtime and full Stats API queries.']}]
+}
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def request(url, *, method='GET', json_body=None, headers=None):
+    data = None if json_body is None else json.dumps(json_body).encode()
+    req = urllib.request.Request(url, data=data, method=method, headers={
+        **(headers or {}), 'Accept': 'application/json', 'Content-Type': 'application/json',
+        'User-Agent': f'plausible/{VERSION}'})
+    try:
+        with urllib.request.build_opener(NoRedirect).open(req, timeout=30) as response:
+            return response.geturl(), response.status, response.read()
+    except urllib.error.HTTPError as exc:
+        # Server bodies can contain request data, so do not echo them or the key.
+        hint = ' Check your Stats API key and site access.' if exc.code in (401, 403) else ''
+        raise backend.SetupError(f'Plausible returned HTTP {exc.code}.{hint}') from None
+    except (urllib.error.URLError, TimeoutError, OSError):
+        raise backend.SetupError('Could not reach the Plausible instance.') from None
+
+
+backend.request_url = request
+
+
+def origin(value):
+    parsed = urllib.parse.urlsplit(value)
+    if (parsed.scheme != 'https' or not parsed.hostname or parsed.username or parsed.password
+            or parsed.path not in ('', '/') or parsed.query or parsed.fragment):
+        raise backend.SetupError('Use an HTTPS origin without a path, credentials, query or fragment.')
+    return value.rstrip('/')
+
+
+def config_path():
+    return Path(os.environ.get('PLAUSIBLE_CLI_CONFIG', str(Path.home() / '.config/plausible/config.json')))
+
+
+def config():
+    try:
+        saved = json.loads(config_path().read_text())
+        if not isinstance(saved, dict) or not isinstance(saved.get('url'), str) or not isinstance(saved.get('site'), str):
+            raise ValueError()
+        saved['url'] = origin(saved['url'])
+        saved['site'] = backend.validate_domain(saved['site'])
+        return saved
+    except FileNotFoundError:
+        raise backend.SetupError('Run plausible login --url https://plausible.example.com --site example.com first.') from None
+    except (OSError, ValueError):
+        raise backend.SetupError('Could not read the Plausible CLI configuration.') from None
+
+
+def service(url):
+    return 'plausible-stats:' + urllib.parse.urlsplit(url).netloc
+
+
+def query(url, key, body):
+    if not isinstance(body, dict):
+        raise backend.SetupError('The query must be a JSON object.')
+    _, _, raw = request(url + '/api/v2/query', method='POST', json_body=body,
+                        headers={'Authorization': 'Bearer ' + key})
+    try:
+        result = json.loads(raw)
+        if not isinstance(result, dict) or not isinstance(result.get('results'), list):
+            raise ValueError()
+        return result
+    except (ValueError, UnicodeDecodeError):
+        raise backend.SetupError('Plausible returned an invalid query response.') from None
+
+
+def positive(value):
+    number = int(value)
+    if number < 1 or number > 10000:
+        raise argparse.ArgumentTypeError('Use a number between 1 and 10000.')
+    return number
+
+
+def parser():
+    p = argparse.ArgumentParser(description=MANIFEST['summary'], epilog='Output is JSON by default. Keys are entered only at the hidden login prompt.')
+    p.add_argument('--version', action='version', version=f'plausible {VERSION}')
+    commands = p.add_subparsers(dest='command', required=True)
+    cap = commands.add_parser('capabilities', help='Discover agent tasks and releases, without authentication')
+    cap.add_argument('--json', action='store_true')
+    login = commands.add_parser('login', help='Validate and save a Stats API key from a hidden prompt')
+    login.add_argument('--url', required=True)
+    login.add_argument('--site', required=True)
+    commands.add_parser('status', help='Check saved credentials with a read-only query')
+    commands.add_parser('logout', help='Remove CLI configuration; keep the shared Keychain key')
+    for name, help_text in [('report', 'Traffic summary, pages, sources and goals'), ('breakdown', 'Group traffic by a dimension'), ('timeseries', 'Traffic over time'), ('realtime', 'Current visitors'), ('query', 'Send a complete Stats API v2 query')]:
+        sub = commands.add_parser(name, help=help_text)
+        sub.add_argument('--site', help='Override the website saved at login')
+        if name == 'query':
+            sub.add_argument('--file', required=True, help='JSON query file, or - for stdin; supports all Stats API v2 options')
+            continue
+        if name == 'realtime':
+            continue
+        sub.add_argument('--period', default='7d')
+        sub.add_argument('--limit', type=positive, default=10000 if name == 'timeseries' else 20)
+        if name in ('report', 'breakdown'):
+            sub.add_argument('--format', choices=['json', 'text', 'csv', 'markdown'], default='json')
+        if name == 'report':
+            sub.add_argument('--compare', choices=['previous'])
+        if name == 'breakdown':
+            sub.add_argument('--by', required=True, help='page, source, country, goal, device, or prop:NAME; use query for other API dimensions')
+            sub.add_argument('--filter', action='append', default=[], help='Repeat NAME=VALUE; * matches contains')
+        if name == 'timeseries':
+            sub.add_argument('--interval', choices=['hour', 'day', 'week', 'month'], default='day')
+    return p
+
+
+def main(argv=None):
+    args = parser().parse_args(argv)
+    try:
+        if args.command == 'capabilities':
+            if args.json:
+                print(json.dumps(MANIFEST, indent=2))
+            else:
+                print(f'plausible {VERSION}\n{MANIFEST["summary"]}\n')
+                for item in MANIFEST['capabilities']:
+                    print(f'{item["description"]}\n  {item["command"]}')
+                print('\nChanges:')
+                for release in MANIFEST['changelog']:
+                    print(f'{release["version"]} ({release["date"]}): ' + '; '.join(release['changes']))
+            return 0
+        if args.command == 'login':
+            url, site = origin(args.url), backend.validate_domain(args.site)
+            if not sys.stdin.isatty():
+                raise backend.SetupError('Run plausible login in an interactive terminal. Never paste the key into chat.')
+            print('Create a Stats API key in your Plausible account settings, then paste it below.', file=sys.stderr)
+            key = getpass.getpass('Stats API key (hidden): ').strip()
+            if not key or any(c.isspace() for c in key):
+                raise backend.SetupError('Enter a nonempty API key without whitespace.')
+            query(url, key, {'site_id': site, 'date_range': 'day', 'metrics': ['visitors']})
+            backend.store_generated_secret(service(url), 'stats-api', key)
+            path = config_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fd, temporary = tempfile.mkstemp(dir=path.parent, prefix='.config-')
+            try:
+                with os.fdopen(fd, 'w') as stream:
+                    json.dump({'url': url, 'site': site}, stream, indent=2)
+                os.replace(temporary, path)
+            finally:
+                Path(temporary).unlink(missing_ok=True)
+            print(json.dumps({'authenticated': True, 'url': url, 'site': site}))
+            return 0
+        saved = config()
+        url, site = saved['url'], backend.validate_domain(getattr(args, 'site', None) or saved['site'])
+        if args.command == 'logout':
+            config_path().unlink()
+            print(json.dumps({'authenticated': False}))
+            return 0
+        try:
+            key = backend.keychain_secret(service(url))
+        except backend.MissingKeychainItem:
+            raise backend.SetupError('No saved Stats API key. Run plausible login in your terminal.') from None
+        if args.command == 'status':
+            query(url, key, {'site_id': site, 'date_range': 'day', 'metrics': ['visitors']})
+            result = {'authenticated': True, 'url': url, 'site': site}
+        elif args.command == 'query':
+            raw = sys.stdin.read() if args.file == '-' else Path(args.file).read_text()
+            body = json.loads(raw)
+            if not isinstance(body, dict):
+                raise backend.SetupError('The query must be a JSON object.')
+            if args.site or 'site_id' not in body:
+                body['site_id'] = site
+            result = query(url, key, body)
+        elif args.command == 'report':
+            result = backend.build_report(url, key, site, args.period, args.limit, compare=args.compare)
+        elif args.command == 'breakdown':
+            result = backend.build_breakdown(url, key, site, args.period, args.by, args.limit, args.filter)
+        elif args.command == 'timeseries':
+            result = query(url, key, {'site_id': site, 'date_range': args.period, 'metrics': ['visitors', 'pageviews'], 'dimensions': ['time:' + args.interval], 'pagination': {'limit': args.limit, 'offset': 0}, 'include': {'time_labels': True}})
+        else:
+            _, _, raw = request(url + '/api/v1/stats/realtime/visitors?' + urllib.parse.urlencode({'site_id': site}), headers={'Authorization': 'Bearer ' + key})
+            count = json.loads(raw)
+            if type(count) is not int or count < 0:
+                raise backend.SetupError('Plausible returned an invalid realtime response.')
+            result = {'site': site, 'visitors': count}
+        output_format = getattr(args, 'format', 'json')
+        if output_format == 'json':
+            print(json.dumps(result, indent=2))
+        elif args.command == 'breakdown':
+            print(backend.format_breakdown(result, output_format))
+        else:
+            formatter = {'text': backend.format_report, 'csv': backend.format_report_csv, 'markdown': backend.format_report_markdown}[output_format]
+            print(formatter(result))
+        return 0
+    except (backend.SetupError, OSError, ValueError, EOFError):
+        # Keep parser/IO errors from including query contents or credentials.
+        exc = sys.exc_info()[1]
+        message = str(exc) if isinstance(exc, backend.SetupError) else 'Could not read configuration or query JSON.'
+        print(json.dumps({'error': message}), file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print('{"error": "Cancelled."}', file=sys.stderr)
+        return 130
+
+
+if __name__ == '__main__':
+    sys.exit(main())

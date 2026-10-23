@@ -40,6 +40,33 @@ Never assume a vendor, account, analytics origin, or tracked website domain. Let
 
 Pass `--domain example.com` when domain inference is wrong and `--target path/to/layout` when the shared `<head>` file is ambiguous.
 
+## API-key login and agent queries
+
+For an existing instance, use `plausible`. Have the user run this in their
+interactive terminal, entering a Stats API key at the hidden prompt:
+
+```bash
+plausible login --url https://plausible.example.com --site example.com
+```
+
+Never ask for a key in chat. Login validates access before storing the key in
+Keychain. Subsequent commands never create or rotate keys. JSON is the default:
+
+```bash
+plausible status
+plausible report --period 30d --compare previous
+plausible breakdown --by page --filter source=Google
+plausible timeseries --period 30d
+plausible realtime
+plausible query --file query.json
+plausible capabilities --json
+```
+
+Use `--site` to select another accessible website. `query` accepts the complete
+Stats API v2 body, including custom dates, filters, ordering, and pagination.
+The API key controls access; the CLI cannot list sites through the Stats API.
+`logout` removes CLI configuration and keeps the shared Keychain item.
+
 ## Report analytics
 
 Run a human-readable report containing summary metrics, top pages, top sources, and goal conversions:
